@@ -76,37 +76,99 @@ Each phase builds on the last. Phases 0–4 are the critical path; phases 5–9 
 
 ---
 
+## Phase 1.5: Crafter Symbolic Bridge (4 Achievements, Tabular)
+
+**Goal**: Bridge the gap between MiniGrid (toy) and full Crafter (complex). Run the same tabular mechanism on Crafter's symbolic observations with only the first 4 achievements unlocked, before adding a neural network.
+
+### Why This Phase Exists
+MiniGrid has ~256 augmented states. Full Crafter has 22 achievements and pixel/symbolic obs. Skipping directly to full Crafter makes it hard to debug failures — this phase isolates the environment complexity increase from the neural network complexity increase.
+
+### Environment
+- Crafter in symbolic observation mode (9×9 grid, 22 object types per cell)
+- Restrict active achievements to: `{collect_wood, make_crafting_table, collect_sapling, collect_coal}`
+- These 4 form a shallow sub-DAG, no deep dependencies
+- Augmented state: `(symbolic_obs_hash, achievement_bit_vector_4bit)` — 16 layers
+
+### State Hashing
+Since symbolic obs are structured arrays (not pixel images), hash them:
+```python
+state_key = (hash(obs.tobytes()), tuple(achievement_bits))
+```
+This is exact for symbolic mode (obs are integer grids, no floating point noise).
+
+### Agent
+- Same tabular Q-table from Phase 1 but indexed by hashed augmented state
+- Counts live in a regular Python dict (state_key → int)
+
+### Experiments
+1. Single agent: milestone discovery order and time to first hit each of the 4 achievements
+2. 2-agent competitive: does repulsion help in a larger, sparser state space than MiniGrid?
+3. Verify the bit vector expands the state space correctly on each achievement unlock
+
+### Success Criteria
+- Agent discovers all 4 achievements at least once within 200k steps
+- Each achievement unlock visibly spikes "novel states available" in the coverage plot
+- State space expansion on achievement unlock verified by unit test
+
+---
+
 ## Phase 2: Single-Agent Neural Count-Based RL
 
-**Goal**: Replace Q-table with a PPO policy network that takes `[s_t | C_t]` as input. Validate that the neural agent achieves comparable coverage to the tabular baseline.
+**Goal**: Replace Q-table with a PPO policy network that takes `[world_state | achievement_bits | local_counts]` as input. Validate that the neural agent achieves comparable coverage to the tabular baseline.
+
+### Input Structure
+
+The policy receives three distinct inputs, concatenated before the first FC layer:
+
+```
+policy_input = [world_state_embedding | achievement_bit_vector | local_counts]
+
+  world_state_embedding : flattened symbolic obs or CNN output for pixels
+  achievement_bit_vector: binary flags for each tracked achievement (e.g. 4 or 22 bits)
+                          bit[i] = 1 means achievement i already claimed (no reward left there)
+                          bit[i] = 0 means achievement i is still novel
+  local_counts          : visit counts for the current cell and its 4 neighbors,
+                          log-normalized: c_norm = log(1 + n(s)) / log(1 + max_n)
+```
+
+The `achievement_bit_vector` is the core signal — it tells the agent what has already been done and therefore where reward still exists. The `local_counts` give spatial novelty awareness without requiring the agent to look up the full global map.
 
 ### Network Architecture
 ```
-Input:  [flat_state | local_count_vector]
-        flat_state:         raw obs flattened (or CNN for image obs)
-        local_count_vector: n(s_t), n(neighbors_4), n(milestone_neighbors)
+Input:  [world_state_embedding | achievement_bits | local_counts]
 
 FC(256) → ReLU → FC(128) → ReLU → Actor head (softmax) + Critic head (scalar)
 ```
 
 ### Agent
 - `agents/ppo_agent.py`: standard PPO (clip ratio 0.2, GAE λ=0.95)
-- Count vector appended to observation before first FC layer
-- Count values log-normalized: `c_norm = log(1 + n(s)) / log(1 + max_n)`
+- Short rollout horizons (128 steps) to mitigate non-stationary value targets
 
 ### Key Design Decisions
-- **Non-stationary value target**: because reward drops to 0 once a state is claimed, the value function target is non-stationary. Mitigation: short rollout horizons (128 steps), high discount decay near claimed states.
-- **Count normalization**: raw counts grow unboundedly; log-normalize to keep input scale stable.
-- **Obs wrapper**: `CountObsWrapper` concatenates count vector to obs before policy sees it.
+
+**Non-stationary value target**: reward drops to 0 once a state is claimed, so the value function target shifts throughout training. Mitigation: short rollouts (128 steps) and frequent target network updates.
+
+**Bit vector augmentation (critical)**: during training, the achievement bit vector always reflects the agent's true current state. At inference, we want to probe counterfactuals — "what would it do if wood was still unclaimed?" But those counterfactual inputs are out-of-distribution if the policy was only trained on DAG-consistent bit vectors.
+
+Fix: randomly corrupt the bit vector during training with probability `p_aug=0.1`:
+```python
+# During rollout collection only — not used for actual reward computation
+if random.random() < p_aug:
+    bits_for_policy = randomly_flip_some_bits(true_bits, flip_prob=0.15)
+else:
+    bits_for_policy = true_bits
+```
+This forces the policy to generalize across counterfactual bit patterns, making the inference-time probing meaningful.
 
 ### Experiments
-1. PPO + count input vs. PPO without count input (just intrinsic reward, no count obs)
-2. PPO + count input vs. tabular baseline from Phase 1
-3. Ablation: does seeing `C_t` in the input improve coverage rate beyond just having count-based reward?
+1. PPO + `[world_state | bits | local_counts]` vs. PPO without count/bit input
+2. PPO + full input vs. tabular baseline from Phase 1
+3. **Augmentation ablation**: with vs. without bit vector augmentation (`p_aug=0` vs `p_aug=0.1`) — does augmentation improve counterfactual probe quality without hurting training performance?
 
 ### Success Criteria
 - Neural agent matches tabular coverage within 2× sample efficiency
-- Adding `C_t` to input improves coverage rate vs. reward-only condition (ablation)
+- Adding achievement bits + local counts improves coverage rate vs. reward-only (ablation)
+- With `p_aug=0.1`: setting a bit to 0 at inference visibly changes the action distribution toward that achievement's region
 
 ---
 
@@ -154,10 +216,35 @@ FC(256) → ReLU → FC(128) → ReLU → Actor head (softmax) + Critic head (sc
 
 **Goal**: Add N agents sharing one `GlobalCountMap`. Validate that the competitive repulsion mechanism produces agent specialization and faster collective coverage.
 
+### Explicit Design Decision: Global Firsts vs. Per-Agent Firsts
+
+This is the most important design choice in the whole system. Two options:
+
+**Option A — Global Firsts (competitive)**
+The count map is shared. If Agent A visits `(x=5, y=5, HasKey=1)`, that state is claimed. Agent B earns R=0 for that state forever. The competitive pressure is real and strong.
+- Pro: genuine racing dynamic, agents must diverge to earn reward
+- Con: Agent B's achievement bit vector never flips for wood (Agent A picked it up, not B)
+- Con: late-joining agents get squeezed out of rewarding states
+
+**Option B — Per-Agent Firsts (cooperative count, competitive credit)**
+Each agent has its own novelty registry. The *global* count map is only used for `local_counts` (spatial awareness), not for reward. Each agent's reward is `1` the first time *it* visits a state, regardless of other agents.
+- Pro: all agents always have reward signal; no agent gets starved
+- Pro: the bit vector stays meaningful per-agent (reflects that agent's achievements)
+- Con: weaker competitive pressure; agents may converge on same behavior
+
+**Decision: use Option A (global firsts) with per-agent achievement bit vectors.**
+
+The count map is global — spatial states are claimed globally. But each agent's *achievement bit vector* is local — it only flips when that agent personally achieves the milestone. This means:
+- Two agents can both earn reward for visiting `(x=5, y=5)` in the `HasKey=1` layer *if they each got the key themselves*
+- But only the first agent to visit `(x=5, y=5, HasKey=1)` globally earns reward for that augmented state
+- The bit vector is the agent's personal achievement history; the count map is shared world knowledge
+
+This preserves both the competitive dynamic (global map) and the interpretability interface (per-agent bits).
+
 ### Architecture Changes
 - `GlobalCountMap` upgraded to multiprocessing-safe shared memory (using `multiprocessing.Manager` or `torch.multiprocessing`)
 - Each agent runs in its own process; count map is the only shared state
-- Each agent has its own optimizer, replay buffer, policy network
+- Each agent has its own: optimizer, replay buffer, policy network, achievement bit vector
 - **No gradient sharing** — only the count map is shared
 
 ### Repulsion Mechanism
@@ -197,37 +284,72 @@ Start without the diversity bonus; add only if agents fail to diverge naturally.
 
 ---
 
-## Phase 5: Teacher-Weighted Count Conditioning
+## Phase 5: Bit Vector Goal Conditioning & Counterfactual Probing
 
-**Goal**: Implement the `W·C_t` input mechanism. A weight vector `W` modulates which regions of the count map the agent prioritizes, enabling interpretable curriculum specification.
+**Goal**: Validate the bit vector as an interpretable goal-conditioning and human-interactive interface. Demonstrate that manipulating the bit vector at inference time produces predictable, meaningful behavioral changes — without any additional machinery.
 
-### Design
+### The Core Idea
+
+The achievement bit vector is simultaneously:
+1. **A reward signal** during training: `bit[i]=0` means achievement i is unclaimed, reward is available
+2. **A goal specification** at inference: set `bit[wood]=0` to tell the agent "treat wood as ungathered, go get it"
+3. **A counterfactual interface** for humans: manipulate bits to explore "what would it do if..."
+
+No teacher, no weight vector, no saliency maps required. The interpretability is by construction — the agent was trained to respond to bit states, so probing with modified bits is meaningful as long as augmentation (Phase 2) generalized the policy across counterfactual inputs.
+
+### The Counterfactual Probe Protocol
 
 ```python
-# Policy input construction
-count_vector = count_map.get_local_counts(state, radius=3)   # nearby counts
-weighted_counts = W * count_vector                            # W is the teacher vector
-policy_input = torch.cat([state_embedding, weighted_counts])
+def probe_policy(policy, world_state, true_bits, counterfactual_bits):
+    """
+    Take a fixed world_state, compare action distributions under
+    true vs. counterfactual bit vectors.
+    """
+    with torch.no_grad():
+        dist_true   = policy(world_state, true_bits,          local_counts)
+        dist_counter = policy(world_state, counterfactual_bits, local_counts)
+    return dist_true, dist_counter, kl_divergence(dist_true, dist_counter)
 ```
 
-### Weight Vectors
-- `W = [1, 0, 0, 0]`: prioritize layer 0 (base exploration)
-- `W = [0, 1, 0, 0]`: prioritize HasKey layer
-- `W = [0.5, 0.5, 0, 0]`: balanced between base and HasKey
-- `W = uniform`: no curriculum (baseline)
+**Example probes on MiniGrid KeyDoor (8×8):**
+
+| Probe | True bits | Counterfactual bits | Expected behavior change |
+|-------|-----------|--------------------|-----------------------------|
+| "Pretend no key" | `[HasKey=1, DoorOpen=0]` | `[HasKey=0, DoorOpen=0]` | Agent should move toward key location |
+| "Pretend door open" | `[HasKey=1, DoorOpen=0]` | `[HasKey=1, DoorOpen=1]` | Agent should move toward goal |
+| "Pretend nothing done" | `[HasKey=1, DoorOpen=1]` | `[0, 0]` | Agent returns to exploration mode |
+
+### Human-in-the-Loop Interface
+
+The bit vector is human-legible by design. A person watching the agent can:
+- Read the bit vector and know exactly what the agent "thinks it still needs to do"
+- Override individual bits to redirect behavior without retraining
+- Use the probe protocol to understand *why* the agent is doing what it's doing
+
+This is different from post-hoc interpretability (saliency, probes, LIME). The bit vector is the goal representation; manipulating it is the interpretability mechanism.
 
 ### Experiments
-1. **Fixed W vs. uniform W**: does milestone-biased W produce faster milestone discovery?
-2. **Heterogeneous agents**: in a 4-agent competitive setting, give each agent a different W (one per milestone layer). Hypothesis: agents specialize by milestone branch.
-3. **Interpretability demo**: show that by observing which count dimensions an agent's policy is most sensitive to (via gradient saliency on `W·C_t`), you can infer its "current goal" without access to the reward function.
 
-### Meta-Learner (Optional Extension)
-- A meta-controller observes the global count map and dynamically assigns W vectors to agents to maximize collective coverage entropy
-- This is curriculum RL via count shaping — a potential independent contribution
+1. **Goal-directed bit setting**: freeze a trained policy; set `bit[target_achievement]=0`, all others=1. Measure:
+   - Does the agent navigate toward the target achievement?
+   - How does KL divergence between `true_bits` and `counterfactual_bits` action distributions correlate with how "surprising" the counterfactual is (e.g., DAG-impossible vs. DAG-consistent)?
+
+2. **Augmentation quality check**: compare policies trained with `p_aug=0` vs `p_aug=0.1` on counterfactual probe quality. Metric: does the counterfactual action distribution shift in the *right direction* (toward the target achievement) vs. random noise?
+
+3. **Human redirection demo** (qualitative): in a live MiniGrid session, human observer flips bits in real time and records whether the agent noticeably changes direction. This is the interpretability paper figure.
+
+4. **Out-of-distribution boundary**: systematically test DAG-impossible bit vectors (e.g., `HasIronPickaxe=1, HasCraftingTable=0`). Measure entropy of action distribution — high entropy = policy is confused, low entropy = policy has generalized. Ideally entropy is moderate and the behavior is plausible.
+
+### What We Are Not Doing
+
+- No W weight vector ("teacher" prioritization) — the bit vector already encodes what's done/undone, that's sufficient
+- No gradient saliency on the count input — probing is direct, not indirect
+- No meta-learner for dynamic W assignment — out of scope
 
 ### Success Criteria
-- Milestone-biased W achieves 25% faster milestone discovery than uniform W
-- Gradient saliency on `W·C_t` correctly identifies the agent's milestone priority in >80% of frames
+- On MiniGrid: setting `bit[HasKey]=0` at inference reliably shifts action distribution toward key location in >80% of sampled world states
+- Augmented policy (`p_aug=0.1`) produces lower entropy and more directed behavior on counterfactual probes vs. non-augmented policy
+- Human redirection demo works end-to-end in a Jupyter notebook
 
 ---
 
@@ -273,7 +395,7 @@ This is the critical upgrade from Phase 1 (binary) to continuous-space-compatibl
 1. PPO (standard reward)
 2. Go-Explore (tabular, from paper)
 3. PPO + RND (random network distillation as novelty bonus)
-4. **Ours**: N=4 competitive agents + count map + milestone augmentation + W-conditioning
+4. **Ours**: N=4 competitive agents + global count map + per-agent achievement bits + bit vector augmentation
 
 ### Experiments
 1. **Achievement discovery curve**: # unique achievements unlocked vs. timesteps
@@ -392,28 +514,31 @@ The world model is wrong early in training. Mitigation:
 2. **Territory map**: 8×8 grid colored by which agent first visited each cell (Phase 4 result)
 3. **Milestone discovery timeline**: horizontal bar chart, one bar per achievement per agent
 4. **Policy divergence plot**: pairwise KL divergence over training time (shows specialization emerging)
-5. **Interpretability demo**: heatmap of gradient saliency on `W·C_t` input dimensions — which counts drive which actions?
+5. **Counterfactual probe figure** (Phase 5 result): 3-panel figure showing a fixed world state, the true bit vector action distribution, and two counterfactual action distributions — arrows on the grid showing where each version of the agent moves
 6. **Coverage entropy plot**: entropy of visit distribution over time (should plateau → triggers stop condition)
+7. **Human redirection demo**: screenshot sequence from the Jupyter notebook showing bit flips changing agent trajectory in real time
 
 ### Ablation Table
 
-| Condition | Achievement Score | Coverage Rate | Policy Divergence |
-|-----------|------------------|---------------|-------------------|
-| PPO (reward-based) | | | |
-| PPO + RND | | | |
-| Ours (N=1, no competition) | | | |
-| Ours (N=4, independent maps) | | | |
-| Ours (N=4, shared map) | | | |
-| Ours + W-conditioning | | | |
-| Ours + MCTS | | | |
+| Condition | Achievement Score | Coverage Rate | Policy Divergence | Probe Accuracy |
+|-----------|------------------|---------------|-------------------|----------------|
+| PPO (reward-based) | | | | n/a |
+| PPO + RND | | | | n/a |
+| Ours (N=1, no competition) | | | | |
+| Ours (N=4, independent maps) | | | | |
+| Ours (N=4, shared map, global firsts) | | | | |
+| Ours + bit vector augmentation (p=0.1) | | | | |
+| Ours + MCTS | | | | |
+
+*Probe accuracy*: % of counterfactual probes where action distribution shifts toward the target achievement's location.
 
 ### Paper Structure (target: NeurIPS/ICLR workshop or main track)
-1. Introduction: "only the first visit pays" as a design principle
-2. Related Work: Go-Explore, NGU, count-based, multi-agent novelty
-3. Method: GlobalCountMap, milestone augmentation, competitive dynamics, W-conditioning
+1. Introduction: "only the first visit pays" as a design principle; bit vector as goal + interpretability interface
+2. Related Work: Go-Explore, NGU, count-based, GCRL/UVFA, multi-agent novelty
+3. Method: GlobalCountMap, per-agent achievement bit vector, global firsts decision, bit vector augmentation, counterfactual probe protocol
 4. Experiments: Crafter main result, MiniGrid ablations, policy divergence analysis
-5. Analysis: interpretability of W·C_t, emergent specialization, coverage saturation
-6. Limitations: hand-crafted milestones, scalability to very large state spaces
+5. Analysis: counterfactual probe quality, human redirection demo, coverage saturation
+6. Limitations: hand-crafted milestones, DAG-impossible probes are out-of-distribution, scalability
 7. Conclusion
 
 ### Open-Source Release Checklist
@@ -429,13 +554,15 @@ The world model is wrong early in training. Mitigation:
 
 ```
 Week 1-2:   Phase 0 (scaffolding) + Phase 1 (tabular MiniGrid)
-Week 3-4:   Phase 2 (PPO + count input) + Phase 3 (milestone augmentation)
-Week 5-6:   Phase 4 (competitive multi-agent) — core result
-Week 7:     Phase 5 (W-conditioning + interpretability)
-Week 8-10:  Phase 6 (Crafter) — requires compute, iterate on results
-Week 11:    Phase 7 (continuous spaces) — if Phase 6 looks strong
-Week 12:    Phase 8 (MCTS) — stretch goal
-Week 13-14: Phase 9 (analysis, writing, release)
+Week 3:     Phase 1.5 (Crafter symbolic bridge, 4 achievements, tabular)
+Week 4-5:   Phase 2 (PPO + bit vector + local counts + augmentation)
+Week 6:     Phase 3 (milestone state augmentation, full DAG)
+Week 7-8:   Phase 4 (competitive multi-agent, global firsts) — core result
+Week 9:     Phase 5 (counterfactual probing, human redirection demo)
+Week 10-12: Phase 6 (Crafter full demo) — requires compute, iterate
+Week 13:    Phase 7 (continuous spaces) — if Phase 6 looks strong
+Week 14:    Phase 8 (MCTS) — stretch goal
+Week 15-16: Phase 9 (analysis, writing, release)
 ```
 
 ---
@@ -445,9 +572,11 @@ Week 13-14: Phase 9 (analysis, writing, release)
 | Problem | Severity | Planned Mitigation |
 |---------|----------|--------------------|
 | Continuous/high-dim states break binary registry | Critical | Phase 7: pseudo-counts / RND |
+| Counterfactual bit vectors are out-of-distribution | High | Phase 2: bit vector augmentation (p_aug=0.1) |
 | World model cold-start for MCTS | High | Phase 8: random pre-training, Dyna |
 | Milestone hand-crafting limits generality | High | Future work: bottleneck state detection |
-| Non-stationary value function targets | Medium | Short rollout horizons, frequent resets |
-| Competitive dynamics instability | Medium | Start with implicit repulsion only |
+| Non-stationary value function targets | Medium | Short rollout horizons, frequent target resets |
+| Competitive dynamics instability | Medium | Start with implicit repulsion (global firsts) only |
+| DAG-impossible counterfactuals confuse policy | Medium | Measure probe entropy; only present DAG-consistent probes to humans |
 | Coverage saturation / endgame | Low | Phase 9: entropy stopping condition |
 | MCTS computational cost | Low | Fast learned model + progressive widening |

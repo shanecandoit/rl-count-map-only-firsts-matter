@@ -41,23 +41,31 @@ Each milestone resets novelty for all previously visited positions, giving the a
 │                    Global Count Map                         │
 │          Shared across all agents, read-only per step       │
 │          n(s) = visit count for augmented state s           │
-└──────────────┬──────────────────────────────────────────────┘
-               │  n(s_t), n(neighbors)
-               ▼
+│          A state is claimed globally on first visit         │
+└────────────────────────┬────────────────────────────────────┘
+                         │  n(s_t), n(4 neighbors)  [local_counts]
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Per-Agent Achievement Bit Vector               │
+│   bit[i] = 1  →  achievement i already done by this agent  │
+│   bit[i] = 0  →  achievement i still novel, reward exists  │
+│   Personal to each agent — flips only on that agent's hit   │
+└────────────────────────┬────────────────────────────────────┘
+                         │  [world_state | achievement_bits | local_counts]
+                         ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                   Agent Policy Network                      │
-│   Input:  [s_t | W · C_t]                                  │
-│     s_t   = current raw state                               │
-│     C_t   = local count vector (visit counts near s_t)      │
-│     W     = teacher weight vector (milestone priorities)    │
-│   Output: action distribution π(a | s_t, C_t, W)           │
-└──────────────┬──────────────────────────────────────────────┘
-               │  action a_t
-               ▼
+│   π(a | world_state, achievement_bits, local_counts)        │
+│   Trained with bit vector augmentation (p=0.1) so the       │
+│   policy generalizes to counterfactual bit patterns         │
+└────────────────────────┬────────────────────────────────────┘
+                         │  action a_t
+                         ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                    Environment                              │
-│   Returns: s_{t+1}, milestone flags, done                   │
-│   Reward computed externally from count map                  │
+│   Returns: s_{t+1}, achievement flags, done                 │
+│   Reward = 1 if global count map n(aug_state) == 0          │
+│          = 0 otherwise  (state already claimed globally)    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -65,11 +73,13 @@ Each milestone resets novelty for all previously visited positions, giving the a
 
 | Component | Description |
 |-----------|-------------|
-| `GlobalCountMap` | Thread-safe registry mapping augmented states → visit count |
-| `MilestoneTracker` | Detects flag transitions, triggers state space expansion |
-| `WeightedCountInput` | Constructs `W·C_t` input vector for policy conditioning |
-| `CompetitiveEnvWrapper` | Wraps standard Gym envs, injects count-based reward |
-| `CoverageMetrics` | Tracks coverage rate, milestone discovery time, agent divergence |
+| `GlobalCountMap` | Thread-safe registry: augmented state → global visit count; shared across all agents |
+| `AchievementBitVector` | Per-agent binary flags for each achievement; flips only when that agent personally achieves it |
+| `MilestoneTracker` | Detects flag transitions, expands augmented state space, emits milestone events |
+| `LocalCountInput` | Extracts visit counts for current cell + 4 neighbors from global map for policy input |
+| `CompetitiveEnvWrapper` | Wraps standard Gym envs; computes global-first reward, maintains per-agent bits |
+| `CounterfactualProbe` | Inference-time tool: takes world state + modified bit vector, returns action distribution |
+| `CoverageMetrics` | Tracks coverage %, milestone hit times, per-agent territory, pairwise KL divergence |
 
 ---
 
@@ -84,9 +94,10 @@ Each milestone resets novelty for all previously visited positions, giving the a
 | **Novelty Search** (Lehman & Stanley, 2011) | Same primary objective: novelty over fitness |
 
 **Novel contributions:**
-1. Competitive exploration via shared repulsion (vs. cooperative in existing multi-agent novelty work)
-2. Teacher-weighted count conditioning `W·C_t` as interpretable curriculum mechanism
-3. Milestone-triggered state augmentation as a clean HRL formalism
+1. Competitive exploration via shared repulsion (vs. cooperative in existing multi-agent novelty work), with explicit global-firsts / per-agent-bits design decision
+2. Achievement bit vector as a goal-conditioning + interpretability interface: manipulate bits at inference to probe counterfactuals and redirect behavior without retraining
+3. Bit vector augmentation during training (`p_aug=0.1`) to generalize the policy across counterfactual inputs, making the probing interface meaningful
+4. Milestone-triggered state augmentation as a clean HRL formalism with provable coverage on tabular environments
 
 ---
 
@@ -98,10 +109,11 @@ See [PLAN.md](PLAN.md) for the full phased implementation plan.
 |-------|------|--------|
 | 0 | Foundations & Scaffolding | Planned |
 | 1 | Tabular Baseline (MiniGrid) | Planned |
-| 2 | Single-Agent Count-Based RL | Planned |
+| 1.5 | Crafter Symbolic Bridge (4 achievements, tabular) | Planned |
+| 2 | Neural PPO + Bit Vector + Bit Augmentation | Planned |
 | 3 | Milestone State Augmentation | Planned |
-| 4 | Competitive Multi-Agent | Planned |
-| 5 | Teacher-Weighted Curriculum | Planned |
+| 4 | Competitive Multi-Agent (Global Firsts) | Planned |
+| 5 | Counterfactual Probing & Human Redirection | Planned |
 | 6 | Crafter Main Demo | Planned |
 | 7 | Continuous State Spaces | Planned |
 | 8 | World Model + MCTS | Planned |
@@ -121,8 +133,11 @@ python train.py --env minigrid-keydoor --agents 1 --phase tabular
 # Phase 4: competitive multi-agent
 python train.py --env minigrid-keydoor --agents 4 --shared-count-map
 
+# Phase 5: counterfactual probing (Jupyter notebook)
+jupyter notebook notebooks/counterfactual_probe.ipynb
+
 # Phase 6: Crafter main demo
-python train.py --env crafter --agents 4 --weighted-counts --log-achievements
+python train.py --env crafter --agents 4 --bit-augmentation --log-achievements
 ```
 
 ---
@@ -132,7 +147,8 @@ python train.py --env crafter --agents 4 --weighted-counts --log-achievements
 1. **Coverage rate** — % of augmented state space visited vs. timesteps
 2. **Milestone discovery time** — steps to first reach each milestone flag
 3. **Policy divergence** — pairwise behavioral distance between agents at convergence
-4. **World model generalization** — freeze `T(s,a,s')`, fine-tune on task reward vs. reward-first baseline
+4. **Probe accuracy** — % of counterfactual bit vectors where action distribution shifts toward the target achievement's location (interpretability quality metric)
+5. **World model generalization** — freeze `T(s,a,s')`, fine-tune on task reward vs. reward-first baseline
 
 ---
 
@@ -154,11 +170,17 @@ rl-count-map-only-firsts-matter/
 │   ├── ppo_agent.py         # Phase 2+: PPO with count input
 │   └── mcts_agent.py        # Phase 8: MCTS with novelty bias
 ├── core/
-│   ├── count_map.py         # GlobalCountMap (thread-safe)
+│   ├── count_map.py         # GlobalCountMap (thread-safe, shared across agents)
 │   ├── milestone_tracker.py # MilestoneTracker + state augmentation
-│   └── weighted_counts.py   # W·C_t construction
+│   ├── bit_vector.py        # AchievementBitVector (per-agent, augmented during training)
+│   └── local_counts.py      # LocalCountInput (nearby visit counts for policy)
+├── probing/
+│   └── counterfactual.py    # CounterfactualProbe — flip bits, compare action distributions
+├── notebooks/
+│   └── counterfactual_probe.ipynb  # Human-in-the-loop redirection demo
 ├── experiments/
 │   ├── phase1_tabular.py
+│   ├── phase1_5_crafter_bridge.py
 │   ├── phase4_competitive.py
 │   └── phase6_crafter.py
 ├── analysis/
